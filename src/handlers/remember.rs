@@ -185,10 +185,16 @@ pub fn parse_experience_type(s: Option<&String>) -> ExperienceType {
         "pattern" => Some(ExperienceType::Pattern),
         "conversation" => Some(ExperienceType::Conversation),
         "discovery" => Some(ExperienceType::Discovery),
-        "observation" | "context" => Some(ExperienceType::Context),
+        "context" => Some(ExperienceType::Context),
+        "observation" => Some(ExperienceType::Observation),
+        "codeedit" | "code_edit" => Some(ExperienceType::CodeEdit),
+        "fileaccess" | "file_access" => Some(ExperienceType::FileAccess),
+        "search" => Some(ExperienceType::Search),
+        "command" => Some(ExperienceType::Command),
+        "intention" | "reminder" => Some(ExperienceType::Intention),
         _ => None,
     })
-    .unwrap_or(ExperienceType::Context)
+    .unwrap_or(ExperienceType::Observation)
 }
 
 /// Parse source type from string
