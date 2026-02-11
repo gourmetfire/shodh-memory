@@ -202,10 +202,14 @@ struct LazyNerModel {
 
 impl LazyNerModel {
     fn new(config: &NerConfig) -> Result<Self> {
+        // Force single-threaded ONNX to prevent thread pool deadlock on macOS ARM64.
+        // The Eigen thread pool's spin-to-block transition deadlocks on heterogeneous
+        // cores (P-cores/E-cores) after idle periods. Single thread eliminates the pool.
+        // See: pykeio/ort#516, microsoft/onnxruntime#10270
         let num_threads = std::env::var("SHODH_ONNX_THREADS")
             .ok()
             .and_then(|s| s.parse().ok())
-            .unwrap_or(2);
+            .unwrap_or(1); // Default 1 thread — prevents spin-to-block deadlock
 
         tracing::info!(
             "Loading BERT-NER model from {:?} with {} threads",
@@ -216,7 +220,13 @@ impl LazyNerModel {
         let session = Session::builder()
             .context("Failed to create NER session builder")?
             .with_intra_threads(num_threads)
-            .context("Failed to set NER thread count")?
+            .context("Failed to set NER intra thread count")?
+            .with_inter_threads(1)
+            .context("Failed to set NER inter thread count")?
+            .with_intra_op_spinning(false)
+            .context("Failed to disable NER intra-op spinning")?
+            .with_inter_op_spinning(false)
+            .context("Failed to disable NER inter-op spinning")?
             .commit_from_file(&config.model_path)
             .context("Failed to load NER ONNX model")?;
 

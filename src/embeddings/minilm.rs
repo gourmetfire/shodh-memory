@@ -37,10 +37,14 @@ struct LazyModel {
 
 impl LazyModel {
     fn new(config: &EmbeddingConfig) -> Result<Self> {
+        // Force single-threaded ONNX to prevent thread pool deadlock on macOS ARM64.
+        // The Eigen thread pool's spin-to-block transition deadlocks on heterogeneous
+        // cores (P-cores/E-cores) after idle periods. Single thread eliminates the pool.
+        // See: pykeio/ort#516, microsoft/onnxruntime#10270
         let num_threads = std::env::var("SHODH_ONNX_THREADS")
             .ok()
             .and_then(|s| s.parse().ok())
-            .unwrap_or(2); // Default 2 threads for edge devices
+            .unwrap_or(1); // Default 1 thread — prevents spin-to-block deadlock
 
         tracing::info!(
             "Loading MiniLM-L6-v2 model from {:?} with {} threads",
@@ -51,7 +55,13 @@ impl LazyModel {
         let session = Session::builder()
             .context("Failed to create session builder")?
             .with_intra_threads(num_threads)
-            .context("Failed to set thread count")?
+            .context("Failed to set intra thread count")?
+            .with_inter_threads(1)
+            .context("Failed to set inter thread count")?
+            .with_intra_op_spinning(false)
+            .context("Failed to disable intra-op spinning")?
+            .with_inter_op_spinning(false)
+            .context("Failed to disable inter-op spinning")?
             .commit_from_file(&config.model_path)
             .context("Failed to load ONNX model")?;
 
