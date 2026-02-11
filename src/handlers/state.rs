@@ -34,7 +34,7 @@ use crate::graph_memory::{
     LtpStatus, RelationType, RelationshipEdge,
 };
 use crate::memory::{
-    facts::SemanticFactStore, query_parser, Experience, FeedbackStore, FileMemoryStore,
+    facts::SemanticFactStore, Experience, FeedbackStore, FileMemoryStore,
     MemoryConfig, MemoryId, MemoryStats, MemorySystem, ProspectiveStore, SessionStore, TodoStore,
 };
 use crate::streaming;
@@ -1370,61 +1370,33 @@ impl MultiUserMemoryManager {
             })
             .collect();
 
-        // Extract verbs for multi-hop reasoning
-        let analysis = query_parser::analyze_query(&experience.content);
-        let mut verb_entities: Vec<(String, EntityNode)> = Vec::new();
-        for verb in &analysis.relational_context {
-            let verb_text = verb.text.as_str();
-            let verb_stem = verb.stem.as_str();
+        // NOTE: Verb extraction removed — produces noise entities like "blocking",
+        // "want", "handled" that inflate edge count without aiding retrieval.
 
-            if known_names
-                .iter()
-                .any(|name| name.eq_ignore_ascii_case(verb_text))
-            {
-                continue;
-            }
-            if stop_words.contains(verb_text.to_lowercase().as_str()) {
-                continue;
-            }
-            if verb_text.len() < 3 {
-                continue;
-            }
-
-            for name in [verb_text, verb_stem] {
-                if name.len() < 3 {
-                    continue;
-                }
-                if known_names.iter().any(|n| n.eq_ignore_ascii_case(name)) {
-                    continue;
-                }
-                known_names.push(name.to_string());
-                verb_entities.push((
-                    name.to_string(),
-                    EntityNode {
-                        uuid: uuid::Uuid::new_v4(),
-                        name: name.to_string(),
-                        labels: vec![EntityLabel::Other("Verb".to_string())],
-                        created_at: now,
-                        last_seen_at: now,
-                        mention_count: 1,
-                        summary: String::new(),
-                        attributes: HashMap::new(),
-                        name_embedding: None,
-                        salience: 0.4,
-                        is_proper_noun: false,
-                    },
-                ));
-            }
-        }
-
-        // Combine all entity groups for insertion
-        let all_entities: Vec<(String, EntityNode)> = ner_entities
+        // Combine all entity groups for insertion (no verb entities)
+        let mut all_entities: Vec<(String, EntityNode)> = ner_entities
             .into_iter()
             .chain(tag_entities)
             .chain(allcaps_entities)
             .chain(issue_entities)
-            .chain(verb_entities)
             .collect();
+
+        // Cap entities per memory to prevent N*(N-1)/2 edge explosion.
+        // Keep highest-salience entities first.
+        const MAX_ENTITIES_PER_MEMORY: usize = 10;
+        if all_entities.len() > MAX_ENTITIES_PER_MEMORY {
+            all_entities.sort_by(|a, b| {
+                b.1.salience
+                    .partial_cmp(&a.1.salience)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+            all_entities.truncate(MAX_ENTITIES_PER_MEMORY);
+            tracing::debug!(
+                "Capped entities from {} to {} (max per memory)",
+                known_names.len(),
+                MAX_ENTITIES_PER_MEMORY
+            );
+        }
 
         // =====================================================================
         // PHASE 2: GRAPH INSERTION (WITH LOCK)
@@ -1478,9 +1450,27 @@ impl MultiUserMemoryManager {
             }
         }
 
-        // Create relationships between co-occurring entities
-        for i in 0..entity_uuids.len() {
+        // Create relationships between co-occurring entities.
+        // Truncate context to avoid storing full content in every edge
+        // (was cloning full content into N*(N-1)/2 edges — 67MB bloat for 76 memories).
+        const MAX_EDGES_PER_MEMORY: usize = 30;
+        let truncated_context: String = if experience.content.len() > 150 {
+            format!("{}…", &experience.content[..experience.content.floor_char_boundary(150)])
+        } else {
+            experience.content.clone()
+        };
+
+        let mut edge_count = 0usize;
+        'outer: for i in 0..entity_uuids.len() {
             for j in (i + 1)..entity_uuids.len() {
+                if edge_count >= MAX_EDGES_PER_MEMORY {
+                    tracing::debug!(
+                        "Capped edges at {} for memory {}",
+                        MAX_EDGES_PER_MEMORY,
+                        &memory_id.0.to_string()[..8]
+                    );
+                    break 'outer;
+                }
                 let edge = RelationshipEdge {
                     uuid: uuid::Uuid::new_v4(),
                     from_entity: entity_uuids[i].1,
@@ -1491,7 +1481,7 @@ impl MultiUserMemoryManager {
                     valid_at: now,
                     invalidated_at: None,
                     source_episode_id: Some(memory_id.0),
-                    context: experience.content.clone(),
+                    context: truncated_context.clone(),
                     last_activated: now,
                     activation_count: 1,
                     ltp_status: LtpStatus::None,
@@ -1503,6 +1493,7 @@ impl MultiUserMemoryManager {
                 if let Err(e) = graph_guard.add_relationship(edge) {
                     tracing::debug!("Failed to add relationship: {}", e);
                 }
+                edge_count += 1;
             }
         }
         // Lock released here
